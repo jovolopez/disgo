@@ -101,6 +101,11 @@ type connImpl struct {
 
 	openedFunc context.CancelFunc
 
+	// Discord completes a voice handshake with one event from each gateway.
+	// Only open after receiving a fresh pair so old state is never reused.
+	voiceStateReceived  bool
+	voiceServerReceived bool
+
 	ssrcs   map[uint32]snowflake.ID
 	ssrcsMu sync.Mutex
 }
@@ -186,6 +191,8 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 
 	if update.ChannelID == nil {
 		c.state.ChannelID = 0
+		c.voiceStateReceived = false
+		c.voiceServerReceived = false
 		if c.audioSender != nil {
 			c.audioSender.Close()
 			c.audioSender = nil
@@ -198,12 +205,15 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 		c.gateway.Close()
 	} else {
 		c.state.ChannelID = *update.ChannelID
+		c.voiceStateReceived = true
 	}
 	c.state.SessionID = update.SessionID
 	c.state.SelfMute = update.SelfMute
 	c.state.SelfDeaf = update.SelfDeaf
 
-	c.tryOpenGateway()
+	if update.ChannelID != nil {
+		c.tryOpenGateway()
+	}
 }
 
 func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpdate) {
@@ -216,15 +226,18 @@ func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpd
 
 	c.state.Token = update.Token
 	c.state.Endpoint = *update.Endpoint
-
+	c.voiceServerReceived = true
 	c.tryOpenGateway()
 }
 
 func (c *connImpl) tryOpenGateway() {
-	if c.state.Token == "" || c.state.Endpoint == "" || c.state.ChannelID == 0 {
+	if !c.voiceStateReceived || !c.voiceServerReceived ||
+		c.state.Token == "" || c.state.Endpoint == "" || c.state.ChannelID == 0 {
 		return
 	}
 	state := c.state
+	c.voiceStateReceived = false
+	c.voiceServerReceived = false
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -320,7 +333,13 @@ func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bo
 	c.openedFunc = cancel
 	defer cancel()
 
-	if err := c.voiceStateUpdateFunc(ctx, c.state.GuildID, &channelID, selfMute, selfDeaf); err != nil {
+	c.stateMu.Lock()
+	c.voiceStateReceived = false
+	c.voiceServerReceived = false
+	guildID := c.state.GuildID
+	c.stateMu.Unlock()
+
+	if err := c.voiceStateUpdateFunc(ctx, guildID, &channelID, selfMute, selfDeaf); err != nil {
 		return err
 	}
 
