@@ -297,6 +297,11 @@ func (c *connImpl) handleGatewayClose(_ Gateway, err error) {
 	var closeError *websocket.CloseError
 	if errors.As(err, &closeError) {
 		closeCode := GatewayCloseEventCodeByCode(closeError.Code)
+		if closeCode == GatewayCloseEventCodeDisconnected || closeCode == GatewayCloseEventCodeCallTerminated {
+			// These closes can precede the main gateway updates that distinguish
+			// a move from a disconnect. Acting here races those definitive updates.
+			return
+		}
 		if closeCode.NewConnection {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
