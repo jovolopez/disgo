@@ -77,10 +77,7 @@ func NewConn(guildID snowflake.ID, userID snowflake.ID, voiceStateUpdateFunc Sta
 		ssrcs: map[uint32]snowflake.ID{},
 	}
 
-	daveSession := cfg.DaveSessionCreate(cfg.DaveSessionLogger, godave.UserID(userID.String()), conn)
-	conn.dave = daveSession
-	conn.gateway = cfg.GatewayCreateFunc(daveSession, conn.handleMessage, conn.handleGatewayClose, append([]GatewayConfigOpt{WithGatewayLogger(cfg.Logger)}, cfg.GatewayConfigOpts...)...)
-	conn.udp = cfg.UDPConnCreateFunc(daveSession, conn.UserIDBySSRC, append([]UDPConnConfigOpt{WithUDPConnLogger(cfg.Logger)}, cfg.UDPConnConfigOpts...)...)
+	conn.initTransports()
 
 	return conn
 }
@@ -108,6 +105,8 @@ type connImpl struct {
 	// Only open after receiving a fresh pair so old state is never reused.
 	voiceStateReceived  bool
 	voiceServerReceived bool
+	speakingFlags       SpeakingFlags
+	speakingSet         bool
 
 	// gatewayOpenMu serializes calls to Gateway.Open.
 	gatewayOpenMu sync.Mutex
@@ -116,20 +115,40 @@ type connImpl struct {
 	ssrcsMu sync.Mutex
 }
 
+func (c *connImpl) initTransports() {
+	daveSession := c.config.DaveSessionCreate(c.config.DaveSessionLogger, godave.UserID(c.state.UserID.String()), c)
+	c.dave = daveSession
+	c.gateway = c.config.GatewayCreateFunc(daveSession, c.handleMessage, c.handleGatewayClose, append([]GatewayConfigOpt{WithGatewayLogger(c.config.Logger)}, c.config.GatewayConfigOpts...)...)
+	c.udp = c.config.UDPConnCreateFunc(daveSession, c.UserIDBySSRC, append([]UDPConnConfigOpt{WithUDPConnLogger(c.config.Logger)}, c.config.UDPConnConfigOpts...)...)
+}
+
+// resetTransportsLocked replaces the voice transport generation. stateMu must be held.
+func (c *connImpl) resetTransportsLocked() {
+	oldGateway, oldUDP, oldDAVE := c.gateway, c.udp, c.dave
+	c.initTransports()
+	oldGateway.Close()
+	_ = oldUDP.Close()
+	_ = oldDAVE.Close()
+
+	c.ssrcsMu.Lock()
+	clear(c.ssrcs)
+	c.ssrcsMu.Unlock()
+}
+
 func (c *connImpl) SendMLSKeyPackage(mlsKeyPackage []byte) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveMLSKeyPackage, GatewayMessageDataDaveMLSKeyPackage(mlsKeyPackage))
+	return c.Gateway().Send(context.Background(), OpcodeDaveMLSKeyPackage, GatewayMessageDataDaveMLSKeyPackage(mlsKeyPackage))
 }
 
 func (c *connImpl) SendMLSCommitWelcome(mlsCommitWelcome []byte) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveMLSCommitWelcome, GatewayMessageDataDaveMLSCommitWelcome(mlsCommitWelcome))
+	return c.Gateway().Send(context.Background(), OpcodeDaveMLSCommitWelcome, GatewayMessageDataDaveMLSCommitWelcome(mlsCommitWelcome))
 }
 
 func (c *connImpl) SendReadyForTransition(transitionID uint16) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveTransitionReady, GatewayMessageDataDaveProtocolReadyForTransition{TransitionID: transitionID})
+	return c.Gateway().Send(context.Background(), OpcodeDaveTransitionReady, GatewayMessageDataDaveProtocolReadyForTransition{TransitionID: transitionID})
 }
 
 func (c *connImpl) SendInvalidCommitWelcome(transitionID uint16) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveMLSInvalidCommitWelcome, GatewayMessageDataDaveInvalidCommitWelcome{TransitionID: transitionID})
+	return c.Gateway().Send(context.Background(), OpcodeDaveMLSInvalidCommitWelcome, GatewayMessageDataDaveInvalidCommitWelcome{TransitionID: transitionID})
 }
 
 func (c *connImpl) ChannelID() *snowflake.ID {
@@ -153,21 +172,32 @@ func (c *connImpl) UserIDBySSRC(ssrc uint32) snowflake.ID {
 }
 
 func (c *connImpl) Gateway() Gateway {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return c.gateway
 }
 
 func (c *connImpl) SetSpeaking(ctx context.Context, flags SpeakingFlags) error {
-	return c.gateway.Send(ctx, OpcodeSpeaking, GatewayMessageDataSpeaking{
-		SSRC:     c.Gateway().SSRC(),
+	c.stateMu.Lock()
+	c.speakingFlags = flags
+	c.speakingSet = true
+	gateway := c.gateway
+	c.stateMu.Unlock()
+	return gateway.Send(ctx, OpcodeSpeaking, GatewayMessageDataSpeaking{
+		SSRC:     gateway.SSRC(),
 		Speaking: flags,
 	})
 }
 
 func (c *connImpl) UDP() UDPConn {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return c.udp
 }
 
 func (c *connImpl) DAVE() godave.Session {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
 	return c.dave
 }
 
@@ -195,6 +225,10 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
+	if c.closed {
+		return
+	}
+
 	if update.ChannelID == nil {
 		c.state.ChannelID = 0
 		c.voiceStateReceived = false
@@ -208,10 +242,18 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 			c.audioReceiver.Close()
 			c.audioReceiver = nil
 		}
-		_ = c.udp.Close()
-		c.gateway.Close()
+		c.speakingFlags = 0
+		c.speakingSet = false
+		c.resetTransportsLocked()
 	} else {
+		moved := c.state.ChannelID != 0 && c.state.ChannelID != *update.ChannelID
 		c.state.ChannelID = *update.ChannelID
+		if moved {
+			// A move needs a new voice-server handshake. Do not leave the old
+			// websocket, UDP socket, or DAVE epoch around to race the server update.
+			c.cancelGatewayOpenLocked()
+			c.resetTransportsLocked()
+		}
 	}
 	c.state.SessionID = update.SessionID
 	c.state.SelfMute = update.SelfMute
@@ -227,7 +269,7 @@ func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpd
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
-	if update.GuildID != c.state.GuildID || update.Endpoint == nil {
+	if c.closed || update.GuildID != c.state.GuildID || update.Endpoint == nil {
 		return
 	}
 
@@ -243,7 +285,8 @@ func (c *connImpl) tryOpenGateway() {
 		defer c.gatewayOpenMu.Unlock()
 
 		c.stateMu.Lock()
-		status := c.gateway.Status()
+		gateway := c.gateway
+		status := gateway.Status()
 		canOpen := !c.closed && c.voiceStateReceived && c.voiceServerReceived &&
 			c.state.Token != "" && c.state.Endpoint != "" && c.state.ChannelID != 0 &&
 			(status == StatusUnconnected || status == StatusDisconnected)
@@ -260,7 +303,7 @@ func (c *connImpl) tryOpenGateway() {
 		c.stateMu.Unlock()
 		defer cancel()
 
-		err := c.gateway.Open(ctx, state)
+		err := gateway.Open(ctx, state)
 
 		c.stateMu.Lock()
 		c.gatewayOpenCancel = nil
@@ -281,11 +324,19 @@ func (c *connImpl) cancelGatewayOpenLocked() {
 }
 
 func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int, data GatewayMessageData) {
+	c.stateMu.Lock()
+	if gateway != c.gateway {
+		c.stateMu.Unlock()
+		return
+	}
+	udp := c.udp
+	c.stateMu.Unlock()
+
 	switch d := data.(type) {
 	case GatewayMessageDataReady:
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		ourAddress, ourPort, err := c.udp.Open(ctx, d.IP, d.Port, d.SSRC)
+		ourAddress, ourPort, err := udp.Open(ctx, d.IP, d.Port, d.SSRC)
 		if err != nil {
 			c.config.Logger.Error("voice: failed to open voiceudp conn", slog.Any("err", err))
 			break
@@ -297,7 +348,7 @@ func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int,
 			break
 		}
 
-		if err = c.Gateway().Send(ctx, OpcodeSelectProtocol, GatewayMessageDataSelectProtocol{
+		if err = gateway.Send(ctx, OpcodeSelectProtocol, GatewayMessageDataSelectProtocol{
 			Protocol: ProtocolUDP,
 			Data: GatewayMessageDataSelectProtocolData{
 				Address: ourAddress,
@@ -309,11 +360,27 @@ func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int,
 		}
 
 	case GatewayMessageDataSessionDescription:
-		if err := c.udp.SetSecretKey(d.Mode, d.SecretKey); err != nil {
+		if err := udp.SetSecretKey(d.Mode, d.SecretKey); err != nil {
 			c.config.Logger.Error("voice: failed to set secret key", slog.Any("err", err))
 		}
+
 		c.stateMu.Lock()
-		if c.openedChan != nil {
+		speakingFlags, speakingSet := c.speakingFlags, c.speakingSet
+		current := gateway == c.gateway
+		c.stateMu.Unlock()
+		if current && speakingSet {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := gateway.Send(ctx, OpcodeSpeaking, GatewayMessageDataSpeaking{
+				SSRC:     gateway.SSRC(),
+				Speaking: speakingFlags,
+			}); err != nil {
+				c.config.Logger.Error("voice: failed to restore speaking state", slog.Any("err", err))
+			}
+			cancel()
+		}
+
+		c.stateMu.Lock()
+		if gateway == c.gateway && c.openedChan != nil {
 			close(c.openedChan)
 			c.openedChan = nil
 		}
@@ -342,14 +409,22 @@ func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int,
 	}
 }
 
-func (c *connImpl) handleGatewayClose(_ Gateway, err error) {
+func (c *connImpl) handleGatewayClose(gateway Gateway, err error) {
+	c.stateMu.Lock()
+	if gateway != c.gateway || c.closed {
+		c.stateMu.Unlock()
+		return
+	}
+	state := c.state
+	c.stateMu.Unlock()
+
 	var closeError *websocket.CloseError
 	if errors.As(err, &closeError) {
 		closeCode := GatewayCloseEventCodeByCode(closeError.Code)
 		if closeCode.NewConnection {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err = c.Open(ctx, c.state.ChannelID, c.state.SelfMute, c.state.SelfDeaf); err != nil {
+			if err = c.Open(ctx, state.ChannelID, state.SelfMute, state.SelfDeaf); err != nil {
 				c.config.Logger.Error("voice: failed to reopen voice conn after full reconnect close code", slog.Any("err", err))
 			} else {
 				return
@@ -408,13 +483,14 @@ func (c *connImpl) Close(ctx context.Context) {
 	c.voiceServerReceived = false
 	c.cancelGatewayOpenLocked()
 	guildID := c.state.GuildID
+	gateway, udp, dave := c.gateway, c.udp, c.dave
 	c.stateMu.Unlock()
 
 	_ = c.voiceStateUpdateFunc(ctx, guildID, nil, false, false)
 
-	c.gateway.Close()
-	_ = c.udp.Close()
-	_ = c.dave.Close()
+	gateway.Close()
+	_ = udp.Close()
+	_ = dave.Close()
 
 	c.removeConnFunc()
 }
