@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -102,11 +103,18 @@ type connImpl struct {
 	audioReceiver AudioReceiver
 
 	openedFunc context.CancelFunc
+	closed     bool
 
 	// Discord completes a voice handshake with one event from each gateway.
 	// Only open after receiving a fresh pair so old state is never reused.
 	voiceStateReceived  bool
 	voiceServerReceived bool
+
+	// gatewayOpenMu serializes calls to Gateway.Open.
+	gatewayOpenMu sync.Mutex
+
+	// gatewayOpenCancel cancels the in-flight Gateway.Open.
+	gatewayOpenCancel context.CancelFunc
 
 	ssrcs   map[uint32]snowflake.ID
 	ssrcsMu sync.Mutex
@@ -191,9 +199,14 @@ func (c *connImpl) HandleVoiceStateUpdate(update botgateway.EventVoiceStateUpdat
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
+	if c.closed {
+		return
+	}
+
 	if update.ChannelID == nil {
 		c.state.ChannelID = 0
 		c.resetVoiceEventsLocked()
+		c.cancelGatewayOpenLocked()
 		if c.audioSender != nil {
 			c.audioSender.Close()
 			c.audioSender = nil
@@ -219,7 +232,7 @@ func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpd
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 
-	if update.GuildID != c.state.GuildID || update.Endpoint == nil {
+	if c.closed || update.GuildID != c.state.GuildID || update.Endpoint == nil {
 		return
 	}
 
@@ -230,21 +243,41 @@ func (c *connImpl) HandleVoiceServerUpdate(update botgateway.EventVoiceServerUpd
 }
 
 func (c *connImpl) tryOpenGateway() {
-	if c.state.SessionID == "" || c.state.Token == "" || c.state.Endpoint == "" || c.state.ChannelID == 0 {
-		return
-	}
-	if !c.voiceStateReceived || !c.voiceServerReceived {
-		return
-	}
-	state := c.state
-	c.resetVoiceEventsLocked()
 	go func() {
+		c.gatewayOpenMu.Lock()
+		defer c.gatewayOpenMu.Unlock()
+		c.stateMu.Lock()
+		gateway := c.gateway
+		status := gateway.Status()
+		canOpen := !c.closed && c.voiceStateReceived && c.voiceServerReceived &&
+			c.state.SessionID != "" && c.state.Token != "" && c.state.Endpoint != "" && c.state.ChannelID != 0 &&
+			(status == StatusUnconnected || status == StatusDisconnected)
+		if !canOpen {
+			c.stateMu.Unlock()
+			return
+		}
+		state := c.state
+		c.resetVoiceEventsLocked()
 		ctx, cancel := context.WithTimeout(context.Background(), voiceReconnectTimeout)
+		c.gatewayOpenCancel = cancel
+		c.stateMu.Unlock()
 		defer cancel()
-		if err := c.gateway.Open(ctx, state); err != nil {
+		err := gateway.Open(ctx, state)
+		c.stateMu.Lock()
+		c.gatewayOpenCancel = nil
+		c.stateMu.Unlock()
+		if err != nil && !errors.Is(err, context.Canceled) {
 			c.config.Logger.Error("error opening voice gateway", slog.Any("err", err))
 		}
 	}()
+}
+
+// cancelGatewayOpenLocked cancels the in-flight Gateway.Open, if any. stateMu must be held.
+func (c *connImpl) cancelGatewayOpenLocked() {
+	if c.gatewayOpenCancel != nil {
+		c.gatewayOpenCancel()
+		c.gatewayOpenCancel = nil
+	}
 }
 
 func (c *connImpl) handleMessage(gateway Gateway, op Opcode, sequenceNumber int, data GatewayMessageData) {
@@ -347,13 +380,17 @@ func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bo
 	c.config.Logger.Debug("opening voice conn")
 
 	openedCtx, cancel := context.WithCancel(context.Background())
-	c.openedFunc = cancel
-	defer cancel()
-
 	c.stateMu.Lock()
+	if c.closed {
+		c.stateMu.Unlock()
+		cancel()
+		return net.ErrClosed
+	}
+	c.openedFunc = cancel
 	c.resetVoiceEventsLocked()
 	guildID := c.state.GuildID
 	c.stateMu.Unlock()
+	defer cancel()
 
 	if err := c.voiceStateUpdateFunc(ctx, guildID, &channelID, selfMute, selfDeaf); err != nil {
 		return err
@@ -368,11 +405,23 @@ func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bo
 }
 
 func (c *connImpl) Close(ctx context.Context) {
-	_ = c.voiceStateUpdateFunc(ctx, c.state.GuildID, nil, false, false)
+	c.stateMu.Lock()
+	if c.closed {
+		c.stateMu.Unlock()
+		return
+	}
+	c.closed = true
+	c.resetVoiceEventsLocked()
+	c.cancelGatewayOpenLocked()
+	guildID := c.state.GuildID
+	gateway, udp, dave := c.gateway, c.udp, c.dave
+	c.stateMu.Unlock()
 
-	c.gateway.Close()
-	_ = c.udp.Close()
-	_ = c.dave.Close()
+	_ = c.voiceStateUpdateFunc(ctx, guildID, nil, false, false)
+
+	gateway.Close()
+	_ = udp.Close()
+	_ = dave.Close()
 
 	c.removeConnFunc()
 }
