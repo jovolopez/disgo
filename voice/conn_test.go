@@ -207,9 +207,123 @@ func TestVoiceGatewayWaitsForFreshStateAndServerUpdates(t *testing.T) {
 	}
 }
 
+func TestChannelMoveRebuildsTransports(t *testing.T) {
+	var gateways []*gatewayStub
+	var udps []*udpConnStub
+	var updates int
+	var removed bool
+	var conn *connImpl
+
+	conn = NewConn(1, 2,
+		func(_ context.Context, _ snowflake.ID, channelID *snowflake.ID, _ bool, _ bool) error {
+			if channelID != nil {
+				updates++
+			}
+			if conn.openedFunc != nil {
+				conn.openedFunc()
+			}
+			return nil
+		},
+		func() {
+			removed = true
+		},
+		WithConnDaveSessionLogger(discardLogger),
+		WithConnGatewayCreateFunc(func(_ godave.Session, _ EventHandlerFunc, _ CloseHandlerFunc, _ ...GatewayConfigOpt) Gateway {
+			g := &gatewayStub{opened: make(chan State, 1)}
+			gateways = append(gateways, g)
+			return g
+		}),
+		WithUDPConnCreateFunc(func(_ godave.Session, _ SsrcLookupFunc, _ ...UDPConnConfigOpt) UDPConn {
+			u := &udpConnStub{}
+			udps = append(udps, u)
+			return u
+		}),
+	).(*connImpl)
+
+	// join channel 3
+	channelID := snowflake.ID(3)
+	conn.HandleVoiceStateUpdate(botgateway.EventVoiceStateUpdate{VoiceState: discord.VoiceState{
+		GuildID:   1,
+		UserID:    2,
+		ChannelID: &channelID,
+		SessionID: "session-1",
+	}})
+	endpoint1 := "a.discord.media"
+	conn.HandleVoiceServerUpdate(botgateway.EventVoiceServerUpdate{
+		GuildID:  1,
+		Token:    "token-1",
+		Endpoint: &endpoint1,
+	})
+	waitGatewayOpened(t, gateways[0].opened, State{ChannelID: 3, SessionID: "session-1", Token: "token-1", Endpoint: endpoint1})
+
+	if err := conn.SetSpeaking(context.Background(), SpeakingFlagMicrophone); err != nil {
+		t.Fatalf("failed to set speaking: %v", err)
+	}
+
+	// move to channel 4: the old generation must be retired and a fresh one opened
+	channelID = snowflake.ID(4)
+	conn.HandleVoiceStateUpdate(botgateway.EventVoiceStateUpdate{VoiceState: discord.VoiceState{
+		GuildID:   1,
+		UserID:    2,
+		ChannelID: &channelID,
+		SessionID: "session-2",
+	}})
+	if len(gateways) != 2 || len(udps) != 2 {
+		t.Fatalf("expected a fresh transport generation after the move, got %d gateways and %d udp conns", len(gateways), len(udps))
+	}
+	if gateways[0].closeCalls != 1 || udps[0].closeCalls != 1 {
+		t.Errorf("expected the old transports to be closed once, got %d gateway and %d udp close calls", gateways[0].closeCalls, udps[0].closeCalls)
+	}
+
+	endpoint2 := "b.discord.media"
+	conn.HandleVoiceServerUpdate(botgateway.EventVoiceServerUpdate{
+		GuildID:  1,
+		Token:    "token-2",
+		Endpoint: &endpoint2,
+	})
+	waitGatewayOpened(t, gateways[1].opened, State{ChannelID: 4, SessionID: "session-2", Token: "token-2", Endpoint: endpoint2})
+
+	// stale callbacks from the retired generation must be ignored
+	conn.handleMessage(gateways[0], OpcodeSpeaking, 0, GatewayMessageDataSpeaking{SSRC: 42, UserID: 9})
+	if conn.UserIDBySSRC(42) != 0 {
+		t.Error("expected speaking from the retired gateway to be ignored")
+	}
+	conn.handleGatewayClose(gateways[0], errors.New("stale close"))
+	if updates != 0 || removed || gateways[1].closeCalls != 0 || udps[1].closeCalls != 0 {
+		t.Errorf("expected the stale close to be ignored, got %d reopen updates, removed %v, %d gateway and %d udp close calls", updates, removed, gateways[1].closeCalls, udps[1].closeCalls)
+	}
+
+	// the speaking state is restored once the fresh session is established
+	conn.handleMessage(gateways[1], OpcodeSessionDescription, 0, GatewayMessageDataSessionDescription{
+		Mode:      EncryptionModeAEADAES256GCMRTPSize,
+		SecretKey: []byte("secret"),
+	})
+	if !gateways[1].sentSpeaking(SpeakingFlagMicrophone) {
+		t.Error("expected the speaking state to be re-sent on the fresh session")
+	}
+}
+
+func waitGatewayOpened(t *testing.T, opened <-chan State, want State) {
+	t.Helper()
+	select {
+	case state := <-opened:
+		if state.ChannelID != want.ChannelID || state.SessionID != want.SessionID || state.Token != want.Token || state.Endpoint != want.Endpoint {
+			t.Fatalf("gateway opened with %+v, want %+v", state, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gateway did not open")
+	}
+}
+
+type sentMessage struct {
+	op   Opcode
+	data GatewayMessageData
+}
+
 type gatewayStub struct {
 	closeCalls int
 	opened     chan State
+	sent       []sentMessage
 }
 
 func (*gatewayStub) SSRC() uint32 { return 0 }
@@ -227,9 +341,24 @@ func (*gatewayStub) CloseWithCode(int, string) {}
 
 func (*gatewayStub) Status() Status { return StatusDisconnected }
 
-func (*gatewayStub) Send(context.Context, Opcode, GatewayMessageData) error { return nil }
+func (g *gatewayStub) Send(_ context.Context, op Opcode, data GatewayMessageData) error {
+	g.sent = append(g.sent, sentMessage{op: op, data: data})
+	return nil
+}
 
 func (*gatewayStub) Latency() time.Duration { return 0 }
+
+func (g *gatewayStub) sentSpeaking(flags SpeakingFlags) bool {
+	for _, msg := range g.sent {
+		if msg.op != OpcodeSpeaking {
+			continue
+		}
+		if speaking, ok := msg.data.(GatewayMessageDataSpeaking); ok && speaking.Speaking == flags {
+			return true
+		}
+	}
+	return false
+}
 
 type udpConnStub struct {
 	closeCalls int
