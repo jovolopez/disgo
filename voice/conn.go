@@ -133,19 +133,19 @@ type connImpl struct {
 }
 
 func (c *connImpl) SendMLSKeyPackage(mlsKeyPackage []byte) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveMLSKeyPackage, GatewayMessageDataDaveMLSKeyPackage(mlsKeyPackage))
+	return c.Gateway().Send(context.Background(), OpcodeDaveMLSKeyPackage, GatewayMessageDataDaveMLSKeyPackage(mlsKeyPackage))
 }
 
 func (c *connImpl) SendMLSCommitWelcome(mlsCommitWelcome []byte) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveMLSCommitWelcome, GatewayMessageDataDaveMLSCommitWelcome(mlsCommitWelcome))
+	return c.Gateway().Send(context.Background(), OpcodeDaveMLSCommitWelcome, GatewayMessageDataDaveMLSCommitWelcome(mlsCommitWelcome))
 }
 
 func (c *connImpl) SendReadyForTransition(transitionID uint16) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveTransitionReady, GatewayMessageDataDaveProtocolReadyForTransition{TransitionID: transitionID})
+	return c.Gateway().Send(context.Background(), OpcodeDaveTransitionReady, GatewayMessageDataDaveProtocolReadyForTransition{TransitionID: transitionID})
 }
 
 func (c *connImpl) SendInvalidCommitWelcome(transitionID uint16) error {
-	return c.gateway.Send(context.Background(), OpcodeDaveMLSInvalidCommitWelcome, GatewayMessageDataDaveInvalidCommitWelcome{TransitionID: transitionID})
+	return c.Gateway().Send(context.Background(), OpcodeDaveMLSInvalidCommitWelcome, GatewayMessageDataDaveInvalidCommitWelcome{TransitionID: transitionID})
 }
 
 func (c *connImpl) ChannelID() *snowflake.ID {
@@ -274,11 +274,14 @@ func (c *connImpl) tryOpenGateway() {
 		return
 	}
 	state := c.state
+	// Capture the generation while the caller holds stateMu so a reset from a
+	// concurrent move/disconnect can't swap c.gateway under the goroutine.
+	gateway := c.gateway
 	c.resetVoiceEventsLocked()
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), voiceReconnectTimeout)
 		defer cancel()
-		if err := c.gateway.Open(ctx, state); err != nil {
+		if err := gateway.Open(ctx, state); err != nil {
 			c.config.Logger.Error("error opening voice gateway", slog.Any("err", err))
 		}
 	}()
@@ -441,9 +444,16 @@ func (c *connImpl) Open(ctx context.Context, channelID snowflake.ID, selfMute bo
 func (c *connImpl) Close(ctx context.Context) {
 	_ = c.voiceStateUpdateFunc(ctx, c.state.GuildID, nil, false, false)
 
-	c.gateway.Close()
-	_ = c.udp.Close()
-	_ = c.dave.Close()
+	c.stateMu.Lock()
+	gateway, udp, dave := c.gateway, c.udp, c.dave
+	// Signals audio senders/receivers that this conn is gone for good, as
+	// opposed to a transport reset while moving between channels.
+	c.state.ChannelID = 0
+	c.stateMu.Unlock()
+
+	gateway.Close()
+	_ = udp.Close()
+	_ = dave.Close()
 
 	c.removeConnFunc()
 }

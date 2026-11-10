@@ -92,6 +92,13 @@ func (s *defaultAudioReceiver) receive() {
 
 	packet, err := s.conn.UDP().ReadPacket()
 	if errors.Is(err, net.ErrClosed) {
+		// The conn keeps its ChannelID while transports are rebuilt (channel
+		// move, gateway reopen with a fresh session): re-read from the fresh
+		// UDP conn next tick instead of tearing the receiver down.
+		if s.conn.ChannelID() != nil {
+			time.Sleep(OpusFrameSizeMs * time.Millisecond)
+			return
+		}
 		s.Close()
 		return
 	}

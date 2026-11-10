@@ -145,6 +145,13 @@ func (s *defaultAudioSender) send() {
 
 func (s *defaultAudioSender) handleErr(err error) {
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, ErrGatewayNotConnected) {
+		// The conn keeps its ChannelID while transports are rebuilt (channel
+		// move, gateway reopen with a fresh session): the error is transient,
+		// so keep the sender — and with it the user's frame provider — alive.
+		// Only a real teardown (leave/close, ChannelID cleared) stops us.
+		if s.conn.ChannelID() != nil {
+			return
+		}
 		s.Close()
 		return
 	}
