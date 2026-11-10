@@ -3,16 +3,21 @@ package voice
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/disgoorg/godave"
 	"github.com/disgoorg/snowflake/v2"
 	"github.com/gorilla/websocket"
 
 	"github.com/disgoorg/disgo/discord"
 	botgateway "github.com/disgoorg/disgo/gateway"
 )
+
+var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 func TestHandleGatewayCloseStartsFreshConnection(t *testing.T) {
 	tests := []struct {
@@ -79,6 +84,81 @@ func TestHandleGatewayCloseStartsFreshConnection(t *testing.T) {
 			}
 			if removed {
 				t.Error("expected connection to remain registered")
+			}
+		})
+	}
+}
+
+func TestHandleGatewayCloseIgnoresMoveCloseCodes(t *testing.T) {
+	tests := []struct {
+		name         string
+		code         int
+		wantTeardown bool
+	}{
+		{
+			name: "disconnected",
+			code: GatewayCloseEventCodeDisconnected.Code,
+		},
+		{
+			name: "call terminated",
+			code: GatewayCloseEventCodeCallTerminated.Code,
+		},
+		{
+			name:         "rate limited",
+			code:         GatewayCloseEventCodeRateLimited.Code,
+			wantTeardown: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gateway := &gatewayStub{}
+			udp := &udpConnStub{}
+			var updates []*snowflake.ID
+			var removed bool
+			conn := &connImpl{
+				config: defaultConnConfig(),
+				state: State{
+					GuildID:   1,
+					UserID:    2,
+					ChannelID: 3,
+					SessionID: "old-session",
+					Token:     "old-token",
+					Endpoint:  "old.discord.media",
+				},
+				gateway: gateway,
+				udp:     udp,
+				dave:    godave.NewNoopSession(discardLogger, godave.UserID("2"), nil),
+				voiceStateUpdateFunc: func(_ context.Context, _ snowflake.ID, channelID *snowflake.ID, _ bool, _ bool) error {
+					updates = append(updates, channelID)
+					return nil
+				},
+				removeConnFunc: func() {
+					removed = true
+				},
+			}
+
+			conn.handleGatewayClose(gateway, &websocket.CloseError{Code: tt.code})
+
+			if tt.wantTeardown {
+				if !removed {
+					t.Error("expected the conn to be removed")
+				}
+				if len(updates) != 1 || updates[0] != nil {
+					t.Errorf("expected one leave update, got %v", updates)
+				}
+				return
+			}
+			// 4014 & 4022 also mark a channel move: the conn must survive and
+			// reconnect once the fresh voice events arrive.
+			if removed {
+				t.Error("expected the conn to stay registered")
+			}
+			if len(updates) != 0 {
+				t.Errorf("expected no voice state updates, got %v", updates)
+			}
+			if gateway.closeCalls != 0 || udp.closeCalls != 0 {
+				t.Errorf("expected transports to stay untouched, got %d gateway and %d udp close calls", gateway.closeCalls, udp.closeCalls)
 			}
 		})
 	}

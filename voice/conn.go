@@ -311,6 +311,13 @@ func (c *connImpl) handleGatewayClose(_ Gateway, err error) {
 	var closeError *websocket.CloseError
 	if errors.As(err, &closeError) {
 		closeCode := GatewayCloseEventCodeByCode(closeError.Code)
+		// 4014 & 4022 also close the gateway when the bot is moved to another
+		// channel. Wait for the fresh VoiceStateUpdate + VoiceServerUpdate pair
+		// to reconnect instead of tearing the conn down; a real disconnect
+		// arrives as a VoiceStateUpdate with a nil ChannelID which already closes it.
+		if closeCode == GatewayCloseEventCodeDisconnected || closeCode == GatewayCloseEventCodeCallTerminated {
+			return
+		}
 		newConnection = closeCode.NewConnection
 	}
 
